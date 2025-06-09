@@ -1,278 +1,282 @@
-import cupy as cp
+from sklearn.metrics.pairwise import manhattan_distances
+from multiprocessing import Pool, cpu_count
+import random
 import numpy as np
+import concurrent.futures
+import copy
 
-from src import dados
 from src.funcao_objetivo.funcao_objetivo import funcao_objetivo
 
+import numpy as np
+from sklearn.metrics.pairwise import manhattan_distances
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
-def construir_matriz_heuristica_gpu_vetorizada_pedidos(dados):
-    # Pega os vetores dos pedidos corretamente
-    pedidos = list(dados['armazem']['pedidos'].values())
-    # Conversão explícita para numpy float64 (CPU)
-    matriz_np = np.array(pedidos, dtype=np.float64)
-    # Envia para GPU
-    matriz_pedidos = cp.asarray(matriz_np)
-    # Produto interno entre todos os vetores (N x N)
-    produto_interno = matriz_pedidos @ matriz_pedidos.T
-    # Normas dos vetores
-    normas = cp.linalg.norm(matriz_pedidos, axis=1)
-    # Produto externo das normas
-    norma_matriz = cp.outer(normas, normas)
-    # Similaridade do cosseno com tratamento de divisão por zero
-    heuristica = cp.where(norma_matriz == 0, 0, 1/(1-(produto_interno / norma_matriz)))
+import numpy as np
+from sklearn.metrics.pairwise import manhattan_distances
+from multiprocessing import Pool, cpu_count
+from functools import partial
+
+
+def calcular_bloco_heuristica(args):
+    """
+    Calcula um bloco da matriz heurística para melhor aproveitamento de cache
+    e redução de overhead na comunicação entre processos.
+    """
+    start_i, end_i, start_j, end_j, dados, quantidade_pedidos, dimensao = args
+    bloco = np.zeros((end_i - start_i, end_j - start_j))
+
+    for i in range(start_i, end_i):
+        for j in range(start_j, end_j):
+            if i >= quantidade_pedidos and j >= quantidade_pedidos:
+                # Otimização: pré-calcula índices
+                idx_i = i - quantidade_pedidos
+                idx_j = j - quantidade_pedidos
+                bloco[i - start_i, j - start_j] = manhattan_distances(
+                    [dados['armazem']['corredores'][idx_i]],
+                    [dados['armazem']['corredores'][idx_j]])[0][0]
+            elif i < quantidade_pedidos and j < quantidade_pedidos:
+                bloco[i - start_i, j - start_j] = manhattan_distances(
+                    [dados['armazem']['pedidos'][i]],
+                    [dados['armazem']['pedidos'][j]])[0][0]
+            elif i < quantidade_pedidos and j >= quantidade_pedidos:
+                bloco[i - start_i, j - start_j] = manhattan_distances(
+                    [dados['armazem']['pedidos'][i]],
+                    [dados['armazem']['corredores'][j - quantidade_pedidos]])[0][0]
+            else:
+                bloco[i - start_i, j - start_j] = manhattan_distances(
+                    [dados['armazem']['corredores'][i - quantidade_pedidos]],
+                    [dados['armazem']['pedidos'][j]])[0][0]
+
+    return start_i, end_i, start_j, end_j, 1 / (bloco + 1e-10)
+
+
+def construir_heuristica(dados, block_size=50):
+    """
+    Versão altamente otimizada com:
+    - Paralelismo por blocos (melhor para cache)
+    - Pré-processamento de dados
+    - Balanceamento dinâmico de carga
+    """
+    # Validação de entrada acelerada
+    try:
+        quantidade_pedidos = len(dados['armazem']['pedidos'])
+        quantidade_corredores = len(dados['armazem']['corredores'])
+    except (KeyError, TypeError) as e:
+        raise ValueError("Estrutura de dados inválida") from e
+
+    dimensao = quantidade_pedidos + quantidade_corredores
+    heuristica = np.zeros((dimensao, dimensao))
+
+    # Pré-processamento para reduzir acesso a dict
+    corredores = np.array(dados['armazem']['corredores'])
+    pedidos = np.array(dados['armazem']['pedidos'])
+
+    # Otimização: tamanho do bloco baseado na dimensão
+    block_size = min(block_size, dimensao // (cpu_count() * 2) or 1)
+
+    # Gerar blocos para processamento paralelo
+    blocks = []
+    for i in range(0, dimensao, block_size):
+        for j in range(0, dimensao, block_size):
+            blocks.append((
+                i, min(i + block_size, dimensao),
+                j, min(j + block_size, dimensao),
+                dados, quantidade_pedidos, dimensao
+            ))
+
+    # Processamento paralelo com chunksize ajustado
+    with Pool(processes=cpu_count()) as pool:
+        results = pool.map(calcular_bloco_heuristica, blocks,
+                           chunksize=max(1, len(blocks) // (cpu_count() * 4)))
+
+    # Montagem da matriz final
+    for start_i, end_i, start_j, end_j, bloco in results:
+        heuristica[start_i:end_i, start_j:end_j] = bloco
+
     return heuristica
 
-def construir_matriz_heuristica_gpu_vetorizada_corredores(dados):
-    # Pega os vetores dos pedidos corretamente
-    corredores = list(dados['armazem']['corredores'].values())
-    # Conversão explícita para numpy float32 (CPU)
-    matriz_np = np.array(corredores, dtype=np.float64)
-    # Envia para GPU
-    matriz_corredores = cp.asarray(matriz_np)
-    # Produto interno entre todos os vetores (N x N)
-    produto_interno = matriz_corredores @ matriz_corredores.T
-    # Normas dos vetores
-    normas = cp.linalg.norm(matriz_corredores, axis=1)
-    # Produto externo das normas
-    norma_matriz = cp.outer(normas, normas)
-    # Similaridade do cosseno com tratamento de divisão por zero
-    heuristica = cp.where(norma_matriz == 0, 0, 1/(1-(produto_interno / norma_matriz)))
-    return heuristica
 
-def construir_heuristica_gpu_vetorizada_corredores2(dados):
-    num_itens = len(next(iter(dados['armazem']['pedidos'].values())))
-    num_corredores = len(dados['armazem']['corredores'])
+def demanda_atendida(demanda, oferta):
+    return np.all(demanda <= oferta)
 
-    # Vetor de demanda
-    pedidos_wave = [dados['armazem']['pedidos'][p] for p in dados['wave']['pedidos']]
-    matriz_pedidos = cp.asarray(pedidos_wave, dtype=cp.float32)
-    demanda = cp.sum(matriz_pedidos, axis=0)
+def construir_solucao(dados, formiga, heuristica_mat, feromonio_mat, alfa, beta):
+    pedidos_range = len(dados['armazem']['pedidos'])
+    corredores_range = len(dados['armazem']['corredores'])
+    total_vertices = pedidos_range + corredores_range
 
-    # Matriz corredores x itens
-    matriz_corredores = cp.zeros((num_corredores, num_itens), dtype=cp.float64)
-    for idx, itens in enumerate(dados['armazem']['corredores'].values()):
-        matriz_corredores[idx, itens] = 1.0
+    pedidos_disponiveis = [i for i in range(pedidos_range)]
+    corredores_disponiveis = [i for i in range(pedidos_range, total_vertices)]
+    vertices_restantes = [i for i in range(total_vertices)]
 
-    # Matriz de cobertura combinada
-    cobertura_combinada = (matriz_corredores @ demanda)  # (N_corredores,)
+    caminho = []
 
-    # Matriz heurística: soma das coberturas de cada par
-    heuristica = cobertura_combinada[:, None] + cobertura_combinada[None, :]
+    # Inicialização de demanda e oferta
+    demanda = np.zeros(len(dados['armazem']['pedidos'][0]))
+    oferta = np.zeros(len(dados['armazem']['corredores'][0]))
 
-    return heuristica  # Matriz (N_corredores x N_corredores)
+    pedidos_no_caminho = 0
+    corredores_no_caminho = 0
 
+    # Seleção inicial
+    atual = random.choice(list(vertices_restantes))
+    vertices_restantes.remove(atual)
 
-def construir_matriz_heuristica_manhattan_gpu_vetorizada3(dados):
-    # Pega os vetores dos pedidos corretamente
-    corredores = list(dados['armazem']['corredores'].values())
+    if atual < pedidos_range:
+        pedidos_disponiveis.remove(atual)
 
-    # Conversão para numpy (CPU) e depois para cupy (GPU)
-    matriz_corredores = cp.asarray(np.array(corredores, dtype=np.float64))
+        while sum(dados['armazem']['pedidos'][atual]) > dados['wave']['limite_superior']:
+            if not pedidos_disponiveis:
+                break  # Não há mais pedidos viáveis
+            atual = random.choice(list(pedidos_disponiveis))
+            pedidos_disponiveis.remove(atual)
+            vertices_restantes.remove(atual)
 
-    # Calcula a distância de Manhattan entre todos os pares
-    n = matriz_corredores.shape[0]
-    heuristica = cp.zeros((n, n), dtype=cp.float64)
+        demanda += np.array(dados['armazem']['pedidos'][atual])
+        pedidos_no_caminho += 1
 
-    # Versão vetorizada para calcular a matriz de distâncias
-    for i in range(n):
-        heuristica[i, :] = cp.sum(cp.abs(matriz_corredores - matriz_corredores[i, :]), axis=1)
+    else:
+        corredores_disponiveis.remove(atual)
+        oferta += np.array(dados['armazem']['corredores'][atual - pedidos_range])
+        corredores_no_caminho += 1
 
-    # Transforma distância em similaridade (quanto menor a distância, maior a similaridade)
-    # Adicionamos 1 para evitar divisão por zero e inverter a relação
-    heuristica = 1 / (1 + heuristica)
-
-    # Preenche a diagonal com 1 (distância zero para o mesmo elemento)
-    cp.fill_diagonal(heuristica, 1)
-
-    return heuristica
+    caminho.append(atual)
 
 
-def construir_solucao_pedidos(dados, feromonio_mat, heuristica_mat, alfa, beta):
-    atual = np.random.choice(list(dados['armazem']['pedidos'].keys()))
-    caminho = [int(atual)]
-    vertices_nao_visitados = [i for i in range(len(dados['armazem']['pedidos'])) if i != atual]
-    dados['wave']['pedidos'].append(atual)
-    dados['wave']['tamanho'] += sum(dados['armazem']['pedidos'][atual])
-    while vertices_nao_visitados:
+    while ((not demanda_atendida(demanda, oferta) or pedidos_no_caminho == 0 or corredores_no_caminho == 0)) and vertices_restantes:
+
         pontuacoes = []
-        for vertice in vertices_nao_visitados:
+
+
+        for vertice in vertices_restantes:
             feromonio = feromonio_mat[atual, vertice]
             heuristica = heuristica_mat[atual, vertice]
             pontuacao = (feromonio ** alfa) * (heuristica ** beta)
             pontuacoes.append(pontuacao)
-        pontuacoes = cp.array(pontuacoes)
-        probabilidades = pontuacoes / pontuacoes.sum()
-        # Suponha que probabilidades seja cupy.ndarray e soma 1
-        prob_cumsum = cp.cumsum(probabilidades)
-        r = cp.random.random()
 
-        # Busca o índice onde a soma acumulada excede r
-        indice = cp.searchsorted(prob_cumsum, r)
+        pontuacoes = np.array(pontuacoes)
 
-        proximo = vertices_nao_visitados[int(indice.get())]  # Pega da lista de labels (CPU)
+        if np.sum(pontuacoes) == 0:
+            break  # Não há caminho viável
 
-        if (sum(dados['armazem']['pedidos'][proximo]) + dados['wave']['tamanho']) > dados['wave']['limite_superior']:
-            return caminho
+        probabilidades = pontuacoes / np.sum(pontuacoes)
+        prob_cumsum = np.cumsum(probabilidades)
+        r = np.random.random()
+        indice = int(np.searchsorted(prob_cumsum, r))
+
+        proximo = vertices_restantes[indice]
+        vertices_restantes.remove(proximo)
+
+        if proximo < pedidos_range:
+            pedido = dados['armazem']['pedidos'][proximo]
+            if np.sum(demanda) + sum(pedido) <= dados['wave']['limite_superior']:
+                demanda += np.array(pedido)
+                pedidos_no_caminho += 1
+                pedidos_disponiveis.remove(proximo)
+                caminho.append(proximo)
+
+                if np.sum(demanda) == dados['wave']['limite_superior']:
+                    vertices_restantes = [v for v in vertices_restantes if v not in pedidos_disponiveis]
+            else:
+                continue
+
         else:
+            corredor = dados['armazem']['corredores'][proximo - pedidos_range]
+            oferta += np.array(corredor)
+            corredores_no_caminho += 1
+            corredores_disponiveis.remove(proximo)
             caminho.append(proximo)
-            dados['wave']['pedidos'].append(proximo)
-            dados['wave']['tamanho'] += sum(dados['armazem']['pedidos'][proximo])
-            atual = proximo
-            vertices_nao_visitados.remove(proximo)
-    return caminho
 
-def demanda_atendida(demanda, oferta):
-    return cp.all(demanda <= oferta)  # Para arrays CuPy/NumPy
-
-
-def construir_solucao_corredores(dados, feromonio_mat, heuristica_mat, alfa, beta):
-    # Pré-calcula demandas (convertendo tudo para CuPy)
-    pedidos_wave = dados['wave']['pedidos']
-    pedidos_armazem = dados['armazem']['pedidos']
-
-    # Converte tudo para CuPy arrays
-    lista_pedidos = [cp.array(pedidos_armazem[pedido], dtype=cp.float64) for pedido in pedidos_wave]
-    demanda = cp.sum(cp.stack(lista_pedidos), axis=0)
-
-    oferta = cp.zeros_like(demanda)
-    corredores_keys = list(dados['armazem']['corredores'].keys())
-    corredores_values = cp.array(list(dados['armazem']['corredores'].values()), dtype=cp.float64)
-
-    # Escolha inicial
-    atual = np.random.choice(corredores_keys)
-    caminho = [int(atual)]
-    vertices_nao_visitados = {k for k in corredores_keys if k != atual}
-    dados['wave']['corredores'].append(atual)
-
-    while vertices_nao_visitados:
-        # Atualiza oferta
-        oferta += corredores_values[atual]
-
-        if cp.all(demanda <= oferta).get():
-            return caminho
-
-        # Cálculo das probabilidades
-        vertices_disponiveis = list(vertices_nao_visitados)
-
-        # Garante que os índices sejam inteiros
-        indices = [int(v) for v in vertices_disponiveis]
-
-        # Extrai valores das matrizes (convertendo para CuPy se necessário)
-        feromonios = cp.asarray(feromonio_mat[atual, indices])
-        heuristicas = cp.asarray(heuristica_mat[atual, indices])
-
-        # Calcula pontuações
-        pontuacoes = (feromonios ** alfa) * (heuristicas ** beta)
-
-        # Normaliza e converte para CPU para o random.choice
-        prob = cp.asnumpy(pontuacoes / cp.sum(pontuacoes))
-        proximo = np.random.choice(vertices_disponiveis, p=prob)
-
-        caminho.append(proximo)
-        dados['wave']['corredores'].append(proximo)
-        atual = proximo
-        vertices_nao_visitados.remove(proximo)
+    dados['wave']['pedidos'] = [v for v in caminho if v < pedidos_range]
+    dados['wave']['corredores'] = [v - pedidos_range for v in caminho if v >= pedidos_range]
+    dados['wave']['tamanho'] = sum(sum(dados['armazem']['pedidos'][i]) for i in dados['wave']['pedidos'])
 
     return caminho
 
 
-def atualiza_feromonios(feromonio_mat, solucoes, valores, evaporacao, feromonio, ferom_min=0.1):
+def atualiza_feromonios(feromonio_mat, solucoes, valores, evaporacao, feromonio, ferom_min=1):
     # Aplica evaporação
-    feromonio_mat *= (1 - evaporacao)
-
-    # Garante um valor mínimo de feromônio (opcional)
+    feromonio_mat *= 1 - evaporacao
+    # Garante um valor mínimo de feromônio
     feromonio_mat[feromonio_mat < ferom_min] = ferom_min
-
-    # Atualiza feromônios para cada solução
     for solucao, valor in zip(solucoes, valores):
-        if valor <= 0:  # Evita divisão por zero ou valores negativos
+        if valor <= 0:
             continue
-
-        delta = feromonio / valor
+        delta = feromonio * valor
         for i in range(len(solucao) - 1):
             # Verifica índices válidos
             if (0 <= solucao[i] < feromonio_mat.shape[0] and
                     0 <= solucao[i + 1] < feromonio_mat.shape[1]):
                 feromonio_mat[solucao[i], solucao[i + 1]] += delta
-                feromonio_mat[solucao[i + 1], solucao[i]] += delta
+                #feromonio_mat[solucao[i + 1], solucao[i]] += delta
 
-def ant_colony_support(dados, iteracoes, formigas, evaporacao, feromonio, alfa, beta):
-    heuristica_mat = construir_matriz_heuristica_manhattan_gpu_vetorizada3(dados)
-    feromonio_mat = np.ones(heuristica_mat.shape)
-    melhor_solucao = None
+def reseta_feromonios(feromonio_mat, feromonio):
+    feromonio_mat = np.ones(feromonio_mat.shape) * feromonio
+
+
+def ant_colony(dados, iteracoes, formigas, evaporacao, feromonio, alfa, beta, seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    #print("Ant Colony")
+    heuristica_mat = construir_heuristica(dados)
+    #print("Construiu heuristica")
+    feromonio_mat = np.ones(heuristica_mat.shape) * feromonio
+    #print("Construiu feromonio")
+
+    melhores_pedidos = []
+    melhores_corredores = []
+    melhor_tamanho = 0
     melhor_valor = 0
     iteracoes_sem_melhorar = 0
-    for _ in range(iteracoes):
+
+    for iteracao in range(iteracoes):
         ultimo_melhor_valor = melhor_valor
-        if iteracoes_sem_melhorar > iteracoes * 0.02:
+        if iteracoes_sem_melhorar >= 100:
             break
+
         solucoes = []
         valores = []
-        for _ in range(formigas):
-            #print("formiga corredores")
-            dados['wave']['corredores'] = []
-            solucao = construir_solucao_corredores(dados, feromonio_mat, heuristica_mat, alfa, beta)
-            valor = funcao_objetivo(dados)
+
+        def tarefa(formiga_id):
+            dados_local = copy.deepcopy(dados)  # cópia isolada
+            dados_local['wave']['pedidos'] = []
+            dados_local['wave']['corredores'] = []
+            dados_local['wave']['tamanho'] = 0
+
+            solucao = construir_solucao(dados_local, formiga_id, heuristica_mat, feromonio_mat, alfa, beta)
+            valor = funcao_objetivo(dados_local)
+            return solucao, valor, dados_local['wave']['pedidos'], dados_local['wave']['corredores'], dados_local['wave']['tamanho']
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            resultados = list(executor.map(tarefa, range(formigas)))
+
+        for solucao, valor, pedidos, corredores, tamanho in resultados:
             solucoes.append(solucao)
             valores.append(valor)
-            #print(valor)
             if valor > melhor_valor:
                 melhor_valor = valor
-                melhor_solucao = solucao
+                melhores_pedidos = pedidos
+                melhores_corredores = corredores
+                melhor_tamanho = tamanho
+
+
+
         if melhor_valor <= ultimo_melhor_valor:
             iteracoes_sem_melhorar += 1
         else:
             iteracoes_sem_melhorar = 0
+        #if iteracoes_sem_melhorar > 45:
+            #reseta_feromonios(feromonio_mat, feromonio)
+            #pass
+
         atualiza_feromonios(feromonio_mat, solucoes, valores, evaporacao, feromonio)
-    return melhor_solucao, melhor_valor
+        #print(f'Iteracao {iteracao}, melhor valor {melhor_valor}')
+        #print(f'Melhor valor da iteracao: {max(valores)}')
 
+    dados['wave']['pedidos'] = melhores_pedidos
+    dados['wave']['corredores'] = melhores_corredores
+    dados['wave']['tamanho'] = melhor_tamanho
 
-def ant_colony(dados, iteracoes, formigas, evaporacao, feromonio, alfa, beta):
-    heuristica_mat_pedidos = construir_matriz_heuristica_gpu_vetorizada_pedidos(dados)
-    heuristica_mat_corredores = construir_matriz_heuristica_gpu_vetorizada_corredores(dados)
-    feromonio_mat_pedidos = np.ones(heuristica_mat_pedidos.shape)
-    #feromonio_mat_corredores = np.ones(heuristica_mat_corredores.shape)
-    #print("heuristica construida!")
-    #print(heuristica_mat_pedidos)
-    #stop = input("!")
-
-    melhor_solucao = None
-    corredores_para_melhor_solucao = None
-    melhor_valor = 0
-    iteracoes_sem_melhorar = 0
-    for _ in range(iteracoes):
-        ultimo_melhor_valor = melhor_valor
-        if iteracoes_sem_melhorar > 10:
-            break
-        solucoes = []
-        valores = []
-        for _ in range(formigas):
-            #print("formiga pedidos")
-            dados['wave']['pedidos'] = []
-            dados['wave']['tamanho'] = 0
-            solucao = construir_solucao_pedidos(dados, feromonio_mat_pedidos, heuristica_mat_pedidos, alfa, beta)
-            corredores_para_solucao, valor = ant_colony_support(dados, iteracoes, formigas, evaporacao, feromonio, alfa, beta)
-            solucoes.append(solucao)
-            valores.append(valor)
-            #print(solucao)
-            #print(corredores_para_solucao)
-            #print(valor)
-            if valor > melhor_valor:
-                melhor_valor = valor
-                melhor_solucao = solucao
-                corredores_para_melhor_solucao = corredores_para_solucao
-        if melhor_valor <= ultimo_melhor_valor:
-            iteracoes_sem_melhorar += 1
-        else:
-            iteracoes_sem_melhorar = 0
-        atualiza_feromonios(feromonio_mat_pedidos, solucoes, valores, evaporacao, feromonio)
-        print(f'MELHOR VALOR: {melhor_valor}')
-
-    print(melhor_valor)
-    dados['wave']['pedidos'] = sorted(melhor_solucao)
-    print(dados['wave']['pedidos'])
-    dados['wave']['corredores'] = sorted(corredores_para_melhor_solucao)
-    print(dados['wave']['corredores'])
-
-
-
+    #print(dados['wave']['pedidos'])
+    #print(dados['wave']['corredores'])
+    #print(funcao_objetivo(dados))
