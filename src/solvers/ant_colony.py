@@ -1,21 +1,14 @@
-from sklearn.metrics.pairwise import manhattan_distances
-from multiprocessing import Pool, cpu_count
+
 import random
 import numpy as np
+from sklearn.metrics.pairwise import manhattan_distances
+from multiprocessing import Pool, cpu_count
 import concurrent.futures
 import copy
 
 from src.funcao_objetivo.funcao_objetivo import funcao_objetivo
 
-import numpy as np
-from sklearn.metrics.pairwise import manhattan_distances
-from multiprocessing import Pool, cpu_count
-from functools import partial
 
-import numpy as np
-from sklearn.metrics.pairwise import manhattan_distances
-from multiprocessing import Pool, cpu_count
-from functools import partial
 
 
 def calcular_bloco_heuristica(args):
@@ -100,7 +93,15 @@ def construir_heuristica(dados, block_size=50):
 def demanda_atendida(demanda, oferta):
     return np.all(demanda <= oferta)
 
-def construir_solucao(dados, formiga, heuristica_mat, feromonio_mat, alfa, beta):
+def construir_solucao(dados, formiga, heuristica_mat, feromonio_mat, alfa, beta, seed=None):
+    #random.seed(seed)
+    #np.random.seed(seed)
+    if seed is not None:
+        rng = np.random.default_rng(seed)
+        local_random = random.Random(seed)
+    else:
+        rng = np.random.default_rng()
+        local_random = random.Random()
     pedidos_range = len(dados['armazem']['pedidos'])
     corredores_range = len(dados['armazem']['corredores'])
     total_vertices = pedidos_range + corredores_range
@@ -119,7 +120,7 @@ def construir_solucao(dados, formiga, heuristica_mat, feromonio_mat, alfa, beta)
     corredores_no_caminho = 0
 
     # Seleção inicial
-    atual = random.choice(list(vertices_restantes))
+    atual = local_random.choice(list(vertices_restantes))
     vertices_restantes.remove(atual)
 
     if atual < pedidos_range:
@@ -128,7 +129,7 @@ def construir_solucao(dados, formiga, heuristica_mat, feromonio_mat, alfa, beta)
         while sum(dados['armazem']['pedidos'][atual]) > dados['wave']['limite_superior']:
             if not pedidos_disponiveis:
                 break  # Não há mais pedidos viáveis
-            atual = random.choice(list(pedidos_disponiveis))
+            atual = local_random.choice(list(pedidos_disponiveis))
             pedidos_disponiveis.remove(atual)
             vertices_restantes.remove(atual)
 
@@ -161,7 +162,7 @@ def construir_solucao(dados, formiga, heuristica_mat, feromonio_mat, alfa, beta)
 
         probabilidades = pontuacoes / np.sum(pontuacoes)
         prob_cumsum = np.cumsum(probabilidades)
-        r = np.random.random()
+        r = rng.random()
         indice = int(np.searchsorted(prob_cumsum, r))
 
         proximo = vertices_restantes[indice]
@@ -214,9 +215,10 @@ def reseta_feromonios(feromonio_mat, feromonio):
     feromonio_mat = np.ones(feromonio_mat.shape) * feromonio
 
 
-def ant_colony(dados, iteracoes, formigas, evaporacao, feromonio, alfa, beta, seed):
-    random.seed(seed)
-    np.random.seed(seed)
+def ant_colony(dados, iteracoes, formigas, evaporacao, feromonio, alfa, beta, seed=None):
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
     #print("Ant Colony")
     heuristica_mat = construir_heuristica(dados)
     #print("Construiu heuristica")
@@ -243,7 +245,7 @@ def ant_colony(dados, iteracoes, formigas, evaporacao, feromonio, alfa, beta, se
             dados_local['wave']['corredores'] = []
             dados_local['wave']['tamanho'] = 0
 
-            solucao = construir_solucao(dados_local, formiga_id, heuristica_mat, feromonio_mat, alfa, beta)
+            solucao = construir_solucao(dados_local, formiga_id, heuristica_mat, feromonio_mat, alfa, beta, seed)
             valor = funcao_objetivo(dados_local)
             return solucao, valor, dados_local['wave']['pedidos'], dados_local['wave']['corredores'], dados_local['wave']['tamanho']
 

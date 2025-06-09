@@ -1,33 +1,16 @@
 import sys
 from pathlib import Path
+import time
+import random
+import multiprocessing
+import os
+import psutil
 
 from src.dados.escrever_solucao import escrever_solucao
 from src.dados.ler_dados import ler_dados
 from src.funcao_objetivo.funcao_objetivo import funcao_objetivo
 from src.mockup.mockup_instance_0020 import mockup_instance_0020
-
-from src.solvers.aco5 import ant_colony
-
-
-import time
-import random
-
-import time
-import random
-import multiprocessing
-import os
-
-import time
-import random
-import multiprocessing
-import os
-
-import time
-import random
-import multiprocessing
-import os
-import signal
-import psutil
+from src.solvers.ant_colony import ant_colony
 
 def run_ant_colony(dados, formigas, result_queue, seed):
     try:
@@ -86,6 +69,9 @@ def benchmark_ant_colony(instance_name, dados, formigas):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python3 -m src.main.py instance_number.txt")
+        sys.exit(1)
     instancia = sys.argv[1]
     caminho_entrada = Path('data/input/') / instancia
     dados = {}
@@ -95,7 +81,7 @@ if __name__ == "__main__":
         formigas = 1
     benchmark_ant_colony(instancia, dados, formigas)
     #ant_colony(dados, 1000, formigas, 0.5, 1, 1, 2)
-
+    #print(funcao_objetivo(dados))
 
     mockup_instance_0020(dados)
     caminho_saida = Path('data/output/') / instancia

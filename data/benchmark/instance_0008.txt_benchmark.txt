@@ -1,0 +1,1 @@
+Execução 0, seed: 0, func_obj: timeout, tempo: timeout
